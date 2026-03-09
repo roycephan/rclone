@@ -231,6 +231,33 @@ func TestSorterExt(t *testing.T) {
 	}
 }
 
+// Test that startExtSort returns an error instead of panicking when
+// temp file creation fails (e.g. due to permissions or apparmor).
+// See: https://github.com/rclone/rclone/issues/9244
+func TestSorterExtTempFileError(t *testing.T) {
+	ctx := context.Background()
+	ctx, ci := fs.AddConfig(ctx)
+	ci.ListCutoff = 1 // force ext sort on first Add
+
+	callback := func(entries fs.DirEntries) error {
+		return nil
+	}
+	ls, err := NewSorter(ctx, nil, callback, nil)
+	require.NoError(t, err)
+	defer ls.CleanUp()
+
+	// Override tempDir to a path that can't be created, simulating
+	// apparmor or permission denial. This makes extsort.Strings
+	// return a nil sorter.
+	ls.tempDir = "/proc/nonexistent/noperm"
+
+	// Add enough entries to trigger ext sort. Before the fix this
+	// would panic with nil pointer dereference.
+	err = ls.Add(fs.DirEntries{mockobject.Object("a"), mockobject.Object("b")})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sorter:")
+}
+
 // benchFs implements enough of the fs.Fs interface for Sorter
 type benchFs struct{}
 
