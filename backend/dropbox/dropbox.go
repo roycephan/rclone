@@ -336,6 +336,7 @@ type Fs struct {
 	ns             string         // The namespace we are using or "" for none
 	batcher        *batcher.Batcher[*files.UploadSessionFinishArg, *files.FileMetadata]
 	exportExts     []exportExtension
+	cfg            dropbox.Config // SDK config for creating per-namespace clients
 }
 
 type exportType int
@@ -537,6 +538,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		cfg.AsMemberID = memberIDs[0].MemberInfo.Profile.MemberProfile.TeamMemberId
 	}
 
+	f.cfg = cfg
 	f.srv = files.New(cfg)
 	f.svc = files.New(ucfg)
 	f.sharing = sharing.New(cfg)
@@ -879,6 +881,91 @@ func (f *Fs) listSharedFolders(ctx context.Context, callback func(fs.DirEntry) e
 	return nil
 }
 
+// listDir lists the contents of a directory using the given files client.
+// root is the Dropbox API path to list, dir is the rclone directory prefix for results.
+func (f *Fs) listDir(ctx context.Context, srv files.Client, root string, dir string, list *list.Helper) (err error) {
+	started := false
+	var res *files.ListFolderResult
+	for {
+		if !started {
+			arg := files.NewListFolderArg(f.opt.Enc.FromStandardPath(root))
+			arg.Recursive = false
+			arg.Limit = 1000
+			if root == "/" || root == "" {
+				arg.Path = "" // Specify root folder as empty string
+			}
+			err = f.pacer.Call(func() (bool, error) {
+				res, err = srv.ListFolder(arg)
+				return shouldRetry(ctx, err)
+			})
+			if err != nil {
+				switch e := err.(type) {
+				case files.ListFolderAPIError:
+					if e.EndpointError != nil && e.EndpointError.Path != nil && e.EndpointError.Path.Tag == files.LookupErrorNotFound {
+						err = fs.ErrorDirNotFound
+					}
+				}
+				return err
+			}
+			started = true
+		} else {
+			arg := files.ListFolderContinueArg{
+				Cursor: res.Cursor,
+			}
+			err = f.pacer.Call(func() (bool, error) {
+				res, err = srv.ListFolderContinue(&arg)
+				return shouldRetry(ctx, err)
+			})
+			if err != nil {
+				return fmt.Errorf("list continue: %w", err)
+			}
+		}
+		for _, entry := range res.Entries {
+			var fileInfo *files.FileMetadata
+			var folderInfo *files.FolderMetadata
+			var metadata *files.Metadata
+			switch info := entry.(type) {
+			case *files.FolderMetadata:
+				folderInfo = info
+				metadata = &info.Metadata
+			case *files.FileMetadata:
+				fileInfo = info
+				metadata = &info.Metadata
+			default:
+				fs.Errorf(f, "Unknown type %T", entry)
+				continue
+			}
+
+			// Only the last element is reliably cased in PathDisplay
+			entryPath := metadata.PathDisplay
+			leaf := f.opt.Enc.ToStandardName(path.Base(entryPath))
+			remote := path.Join(dir, leaf)
+			if folderInfo != nil {
+				d := fs.NewDir(remote, time.Time{}).SetID(folderInfo.Id)
+				err = list.Add(d)
+				if err != nil {
+					return err
+				}
+			} else if fileInfo != nil {
+				o, err := f.newObjectWithInfo(ctx, remote, fileInfo)
+				if err != nil {
+					return err
+				}
+				if o.(*Object).exportType.listable() {
+					err = list.Add(o)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if !res.HasMore {
+			break
+		}
+	}
+	return list.Flush()
+}
+
 // findSharedFolder find the id for a given shared folder name
 // somewhat annoyingly there is no endpoint to query a shared folder by it's name
 // so our only option is to iterate over all shared folders
@@ -1018,99 +1105,34 @@ func (f *Fs) ListP(ctx context.Context, dir string, callback fs.ListRCallback) (
 		return list.Flush()
 	}
 	if f.opt.SharedFolders {
-		err := f.listSharedFolders(ctx, list.Add)
+		if dir == "" {
+			err := f.listSharedFolders(ctx, list.Add)
+			if err != nil {
+				return err
+			}
+			return list.Flush()
+		}
+		// For subdirectories, use the shared folder's namespace
+		// to list its contents via the files API.
+		firstDir, subDir, _ := strings.Cut(dir, "/")
+		id, err := f.findSharedFolder(ctx, firstDir)
 		if err != nil {
 			return err
 		}
-		return list.Flush()
+		nsCfg := f.cfg.WithNamespaceID(id)
+		nsSrv := files.New(nsCfg)
+		root := ""
+		if subDir != "" {
+			root = "/" + subDir
+		}
+		return f.listDir(ctx, nsSrv, root, dir, list)
 	}
 
 	root := f.slashRoot
 	if dir != "" {
 		root += "/" + dir
 	}
-
-	started := false
-	var res *files.ListFolderResult
-	for {
-		if !started {
-			arg := files.NewListFolderArg(f.opt.Enc.FromStandardPath(root))
-			arg.Recursive = false
-			arg.Limit = 1000
-
-			if root == "/" {
-				arg.Path = "" // Specify root folder as empty string
-			}
-			err = f.pacer.Call(func() (bool, error) {
-				res, err = f.srv.ListFolder(arg)
-				return shouldRetry(ctx, err)
-			})
-			if err != nil {
-				switch e := err.(type) {
-				case files.ListFolderAPIError:
-					if e.EndpointError != nil && e.EndpointError.Path != nil && e.EndpointError.Path.Tag == files.LookupErrorNotFound {
-						err = fs.ErrorDirNotFound
-					}
-				}
-				return err
-			}
-			started = true
-		} else {
-			arg := files.ListFolderContinueArg{
-				Cursor: res.Cursor,
-			}
-			err = f.pacer.Call(func() (bool, error) {
-				res, err = f.srv.ListFolderContinue(&arg)
-				return shouldRetry(ctx, err)
-			})
-			if err != nil {
-				return fmt.Errorf("list continue: %w", err)
-			}
-		}
-		for _, entry := range res.Entries {
-			var fileInfo *files.FileMetadata
-			var folderInfo *files.FolderMetadata
-			var metadata *files.Metadata
-			switch info := entry.(type) {
-			case *files.FolderMetadata:
-				folderInfo = info
-				metadata = &info.Metadata
-			case *files.FileMetadata:
-				fileInfo = info
-				metadata = &info.Metadata
-			default:
-				fs.Errorf(f, "Unknown type %T", entry)
-				continue
-			}
-
-			// Only the last element is reliably cased in PathDisplay
-			entryPath := metadata.PathDisplay
-			leaf := f.opt.Enc.ToStandardName(path.Base(entryPath))
-			remote := path.Join(dir, leaf)
-			if folderInfo != nil {
-				d := fs.NewDir(remote, time.Time{}).SetID(folderInfo.Id)
-				err = list.Add(d)
-				if err != nil {
-					return err
-				}
-			} else if fileInfo != nil {
-				o, err := f.newObjectWithInfo(ctx, remote, fileInfo)
-				if err != nil {
-					return err
-				}
-				if o.(*Object).exportType.listable() {
-					err = list.Add(o)
-					if err != nil {
-						return err
-					}
-				}
-			}
-		}
-		if !res.HasMore {
-			break
-		}
-	}
-	return list.Flush()
+	return f.listDir(ctx, f.srv, root, dir, list)
 }
 
 // Put the object
